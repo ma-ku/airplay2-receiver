@@ -61,6 +61,7 @@ FEATURES = 0x8030040780a00
 FEATURES = 0x1c340405fca00
 """
 
+# 0x4A7FCA00,0xBC354BD0
 
 class Feat(IntFlag):
     # https://emanuelecozzi.net/docs/airplay2/features/
@@ -173,9 +174,8 @@ FEATURES = (
     | Feat.Ft14MFiSoftware | Feat.Ft09AirPlayAudio
 )
 
-
 # PI = Public ID (can be GUID, MAC, some string)
-PI = b'aa5cb8df-7f14-4249-901a-5e748ce57a93'
+PI = None
 
 
 class LTPK():
@@ -216,7 +216,7 @@ Values 0,2,3,4,6 seen.
 HTTP_X_A_HKP = "X-Apple-HKP"
 HTTP_X_A_CN = "X-Apple-Client-Name"
 HTTP_X_A_PD = "X-Apple-PD"
-LTPK = LTPK()
+
 
 
 def setup_global_structs(args):
@@ -225,6 +225,18 @@ def setup_global_structs(args):
     global device_setup_data
     global second_stage_info
     global mdns_props
+    global PI
+    global LTPK
+
+    PI = b'aa5cb8df-7f14-4249-901a-5e748ce57a93'
+
+    if args.group:
+        if args.group_lead:
+            PI = b'aa5cb8df-7f14-4249-901a-5e748ce57a91'
+        else:
+            PI = b'aa5cb8df-7f13-4249-901a-5e758ce57a9'
+
+    LTPK = LTPK()
 
     device_info = {
         # 'OSInfo': 'Linux 3.10.53',
@@ -314,13 +326,19 @@ def setup_global_structs(args):
         "srcvers": SERVER_VERSION,
         "deviceid": DEVICE_ID,  # typically MAC addr
         "features": "%s,%s" % (hex(FEATURES & 0xffffffff), hex(FEATURES >> 32 & 0xffffffff)),
-        "flags": "0x4",
         # "name": "GINO", # random
-        "model": "Airplay2-Receiver",  # random
+        "model": "AudioAccessory1,1", # "Airplay2-Receiver",  # random
         # "manufacturer": "Pino", # random
         # "serialNumber": "01234xX321", # random
         "protovers": "1.1",
-        "acl": "0",  # Access ControL. 0,1,2 == anon,users,admin(?)
+        "acl": "0",  # Access ControL. 0,1,2 == anon,users,admin(?),
+        "flags": "0x4",
+
+        # Flags for grouping of speakers
+        "gid": "5dccfd20-b166-49cc-a593-6abd5f724ddb",  # Group UUID (generated casually)
+        
+        
+
         # These are found under the <deviceid>@<name> mDNS record.
         # "am": "One",  # Model
         # "cn": "0",  # CompressioN. 0,1,2,3 == (None aka) PCM, ALAC, AAC, AAC_ELD
@@ -334,13 +352,34 @@ def setup_global_structs(args):
         "rsf": "0x0",  # bitmask: required sender features(?)
         "fv": "p20.78000.12",  # Firmware version. p20 == AirPlay Src revision?
         "pi": PI,   # Pairing UUID (generated casually)
-        "gid": "5dccfd20-b166-49cc-a593-6abd5f724ddb",  # Group UUID (generated casually)
         "gcgl": "0",  # Group Contains Group Leader.
         # "isGroupLeader": "0"  # See gcgl
         # "vn": "65537",  # (Airplay) version number (supported) 16.16, 65537 == 1.1
         "pk": LTPK.get_pub_string()  # Ed25519 PubKey
     }
 
+    if args.group:
+        mdns_props["gpn"] = "Airplay Test"
+        mdns_props["tsm"] = 0
+        mdns_props["vv"] = 2
+        mdns_props["gcgl"] = 1
+        mdns_props["tsid"] = mdns_props["gid"]
+
+        if args.group_lead:
+            mdns_props["flags"] = "0x1a404"   # leading speaker
+            mdns_props["igl"] = "1"           # leading speaker
+            device_info["statusFlags"] = 107524
+            
+        else:
+            mdns_props["flags"] = "0x38c04"   # the following speaker
+            mdns_props["igl"] = "0"           # leading speaker+
+            device_info["statusFlags"] = 232452
+
+            mdns_props["pgcgl"] = "1"
+            mdns_props["pgid"] = mdns_props["gid"]
+
+        device_info["statusFlags"] = mdns_props["flags"] 
+        device_info["features"] = FEATURES 
 
 class AP2Handler(http.server.BaseHTTPRequestHandler):
 
@@ -1026,6 +1065,8 @@ if __name__ == "__main__":
     mutexgroup = parser.add_mutually_exclusive_group()
 
     parser.add_argument("-m", "--mdns", help="mDNS name to announce", default="myap2")
+    parser.add_argument("-g", "--group", help="Make this part of a group", action='store_true')
+    parser.add_argument("-gl", "--group-lead", help="Make this the group lead", action='store_true')
     parser.add_argument("-n", "--netiface", help="Network interface to bind to. Use the --list-interfaces option to list available interfaces.")
     parser.add_argument("-nv", "--no-volume-management", help="Disable volume management", action='store_true')
     parser.add_argument("-npm", "--no-ptp-master", help="Stops this receiver from being announced as the PTP Master",
