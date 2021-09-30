@@ -135,6 +135,16 @@ python ap2-receiver.py -m myap2 -n [YOUR_INTERFACE_GUID] (looks like this for in
 
 ---
 
+Receiver is part of a group (-g):
+```
+python ap2-receiver.py -m myap2 --netiface=eth0 -f 0xBC354BD04A7FCA00 -g
+````
+
+Receiver is part of a group (-g) and is the leader (-gl):
+```
+python ap2-receiver.py -m myap3 --netiface=eth0 -f 0xBC354BD04A7FCA00 -g -gl
+````
+
 Tested on Python 3.7.5 / macOS 10.15.2 with iPhone X 13.3 and Raspberry Pi 4
 
 ### Protocol notes
