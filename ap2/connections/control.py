@@ -2,7 +2,7 @@ import socket
 import struct
 import multiprocessing
 
-from ..utils import get_logger, get_free_port
+from ..utils import get_file_logger, get_free_port
 
 
 class RTCP:
@@ -15,6 +15,7 @@ class RTCP:
         self.count = data[0] & 0b00011111
         self.ptype = data[1]
         self.plen = ((data[3] | data[2] << 8) + 1) * 4
+        self.syncs = 0
 
         if self.ptype == RTCP.TIME_ANNOUNCE:
             self.rtpTimeRemote = struct.unpack(">I", data[4:8])[0]
@@ -24,22 +25,28 @@ class RTCP:
 
 
 class Control:
-    def __init__(self):
+    def __init__(self, isDebug=False):
+        self.isDebug = isDebug
         self.port = get_free_port()
 
     def handle(self, rtcp):
-        if rtcp.ptype == RTCP.TIME_ANNOUNCE:
-            self.logger.debug("Time announce (215): rtpTimeRemote=%d rtpTime=%d net=%1.7f (%d)" % (rtcp.rtpTimeRemote, rtcp.rtpTime, rtcp.net, rtcp.net_base))
-        else:
-            self.logger.debug("vs=%d pad=%d cn=%d type=%d len=%d ssync=%d" % (rtcp.version, rtcp.padding, rtcp.count, rtcp.ptype, rtcp.plen, rtcp.syncs))
+        if self.isDebug:
+            if rtcp.ptype == RTCP.TIME_ANNOUNCE:
+                msg = f"Time announce (215): rtpTimeRemote={rtcp.rtpTimeRemote}"
+                msg += f" rtpTime={rtcp.rtpTime} net={rtcp.net:1.7f} ({rtcp.net_base})"
+                self.logger.debug(msg)
+            else:
+                msg = f"vs={rtcp.version} pad={rtcp.padding} cn={rtcp.count}"
+                msg += f" type={rtcp.ptype} len={rtcp.plen}"
+                self.logger.debug(msg)
 
     def serve(self):
-        self.logger = get_logger("control", level="DEBUG")
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        addr = ("0.0.0.0", self.port)
-        sock.bind(addr)
-
         try:
+            if self.isDebug:
+                self.logger = get_file_logger("control", level="DEBUG")
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            addr = ("0.0.0.0", self.port)
+            sock.bind(addr)
             while True:
                 data, address = sock.recvfrom(4096)
                 if data:
@@ -47,12 +54,14 @@ class Control:
                     self.handle(rtcp)
         except KeyboardInterrupt:
             pass
+        except OSError as e:
+            self.logger.error(f'{repr(e)}')
         finally:
             sock.close()
 
     @staticmethod
-    def spawn():
-        control = Control()
+    def spawn(isDebug):
+        control = Control(isDebug=False)
         p = multiprocessing.Process(target=control.serve)
         p.start()
         return control.port, p

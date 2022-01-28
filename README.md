@@ -1,22 +1,31 @@
 # Experimental
 
-Very quick python implementation of AP2 protocol using **minimal
+Somewhat comprehensive python implementation of AP2 receiver using **some
 multi-room** features. For now it implements:
-- HomeKit transient pairing (SRP/Curve25519/ChaCha20-Poly1305)
+
+- HomeKit transient pairing (SRP/Curve25519/ChaCha20-Poly1305) - bit flag 48
 - HomeKit non-transient pairing
-- FairPlay (v3) authentication
+- Some refinements for HomeKit interaction (e.g. managed/active flags)
+- Persist device name and some HomeKit properties across restarts (just use the -m flag again to set the device name anew)
+- FairPlay (v3) authentication and decryption of AES keys - the first and only Python implementation. Credit to @systemcrash for implementation.
 - Receiving of both REALTIME and BUFFERED Airplay2 audio streams
 - Airplay2 Service publication
 - Decoding of all Airplay2 supported CODECs: ALAC, AAC, OPUS, PCM.
  Ref: [here](https://emanuelecozzi.net/docs/airplay2/audio/) and 
       [here](https://emanuelecozzi.net/docs/airplay2/rtsp/#setup)
 - Output latency compensation for sync with other Airplay receivers
+- ANNOUNCE and RSA AES for unbuffered streaming from iTunes/Windows
+- Spotify (via AirPlay2) and other live media streams with AES keys.
+
 
 For now it does not implement:
- - MFi Authentication / FairPlay v2 (one of them is required by iTunes/Windows)
- - Audio Sync
+ - FairPlay v2
+ - Accurate audio sync (PTP and/or NTP)
+
+ It may never implement:
+ - MFi Authentication (requires MFi hardware module)
  
-**This code is experimental. This receiver do not expect to be a real receiver but a toolbox for learning/debugging all airplay protocols and related pairing/authentication methods.** 
+**This code is experimental. This receiver does not expect to be a real receiver but a toolbox for learning/debugging all airplay protocols and related pairing/authentication methods.**
 
 Latest additions:
  - Implement RTP buffer (manage FLUSHBUFFERED) : play/pause/timeline/playlist
@@ -42,7 +51,7 @@ docker build -f docker/Dockerfile -t ap2-receiver .
 To run the receiver:
 
 ```zsh
-docker run -it --rm --device /dev/snd --net host ap2-receiver --volume `pwd`/pairings/:/airplay2/pairings/
+docker run -it --rm --device /dev/snd --net host --volume `pwd`/pairings/:/airplay2/pairings/ ap2-receiver
 ```
 
 Default network device is wlan0, you can change this with AP2IFACE env variable:

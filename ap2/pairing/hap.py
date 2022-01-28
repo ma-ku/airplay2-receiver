@@ -6,8 +6,6 @@ import os
 import traceback
 from os import path
 
-from hexdump import hexdump
-
 import hkdf
 from cryptography.hazmat.primitives.asymmetric import x25519
 from cryptography.hazmat.primitives.asymmetric import ed25519
@@ -16,6 +14,7 @@ from cryptography.hazmat.primitives import serialization
 # import nacl.signing
 # from nacl.utils import random
 from Crypto.Cipher import ChaCha20_Poly1305  # PyCryptodome
+from ..utils import get_screen_logger
 
 from . import srp
 # for JSON
@@ -26,7 +25,12 @@ from enum import IntFlag
 PAIRING_STORE = "./pairings/"
 PAIRING_FILE = "pairings.txt"
 LTSK_FILE = "ltsk.txt"
+DEV_PROPS = "device_properties.txt"
 ACCESSORY_SECRET = "accessory-secret"
+
+
+class MFiUnhandledException(Exception):
+    pass
 
 
 class PairingMethod:
@@ -95,7 +99,7 @@ class Tlv8:
             tag = req[ptr]
             length = req[ptr + 1]
             value = req[ptr + 2:ptr + 2 + length]
-            # print("dec tag=%d length=%d value=%s" % (tag, length, value.hex()))
+            # print(f"dec tag={tag} length={length} value={value.hex()}")
             if tag in res:
                 res[tag] = res[tag] + value
             else:
@@ -111,8 +115,7 @@ class Tlv8:
             tag = req[i]
             value = req[i + 1]
             length = len(value)
-
-            # print("enc tag=%d length=%d value=%s" % (tag, length, value.hex()))
+            # print(f"enc tag={tag} length={length} value={value.hex()}")
             if length <= 255:
                 res += bytes([tag]) + bytes([length])
                 if value:
@@ -140,7 +143,8 @@ class JSON_Store():
     @staticmethod
     def save_json(store, path: str):
         with open(path, mode="w", encoding="utf-8") as f:
-            print(store)
+            # logger = get_screen_logger(__name__, 'INFO')
+            # logger.debug(store)
             json.dump(store, f)
 
     def __init__(self, path: str):
@@ -183,27 +187,56 @@ class CRUD_Store:
         self.json_handler.put_store(self.store)
 
     def read_entry(self, _id: bytes, _which: str):
-        return self.store[_id.decode()][_which] + '=='
+        return self.store[_id.decode()][_which]
 
-    def delete_entry(self, _id: bytes):
-        _val = self.store.pop(_id.decode())
-        self.json_handler.put_store(self.store)
-        return _val
+    def delete_entry(self, _id: bytes, _which=None):
+        if not _which:
+            _val = self.store.pop(_id.decode())
+            self.json_handler.put_store(self.store)
+            return _val
+        else:
+            ret = self.store[_id.decode()].pop(
+                f'{_which}'
+            )
+            self.json_handler.put_store(self.store)
+            return ret
 
     # Higher logic
     def set_bytes(self, _id: bytes, _which: str, _val: bytes):
-        self.create_entry(
-            _id,
-            _which,
-            base64.standard_b64encode(
-                _val
-            ).decode()
-        )
+        if _val is not None:
+            self.create_entry(
+                _id,
+                _which,
+                base64.standard_b64encode(
+                    _val
+                ).decode()
+            )
+        else:
+            self.delete_entry(
+                _id,
+                _which,
+            )
 
     def get_bytes(self, _id: bytes, _which: str):
         return base64.standard_b64decode(
             self.read_entry(_id, _which)
         )
+
+    def set_string(self, _id: bytes, _which: str, _val: str):
+        if _val is None or _val == '':
+            self.delete_entry(
+                _id,
+                _which,
+            )
+        else:
+            self.create_entry(
+                _id,
+                _which,
+                _val
+            )
+
+    def get_string(self, _id: bytes, _which: str):
+        return self.read_entry(_id, _which)
 
     def get_ltpk(self, _id: bytes):
         return self.get_bytes(_id, 'LTPK')
@@ -277,16 +310,108 @@ class LTSK(CRUD_Store):
         self.set_permissions(_id, HomeKitPermissions.Admin)
 
 
+class LTPK():
+    # Long Term Public Key - get it from the hap module.
+    def __init__(self, _id, isDebug=False):
+        # Ensure the identifier string is binary (utf8)
+        if not isinstance(_id, (bytes, bytearray)):
+            _id = _id.encode('utf8')
+        announce_id, self.ltpk = Hap(_id, isDebug).configure()
+        self.public_int = int.from_bytes(self.ltpk, byteorder='big')
+        # builds a 64 char hex string, for the 32 byte pub key
+        self.public_string = str.lower("{0:0>4X}".format(self.public_int))
+
+    def get_pub_string(self):
+        return self.public_string
+
+    def get_pub_bytes(self):
+        return self.ltpk
+
+
+class DeviceProperties(CRUD_Store):
+    """
+    This object persists ap2-receiver device properties (the mDNS property)
+    as set by HomeKit
+    """
+    def __init__(self, _id, isDebug=False):
+        self.isDebug = isDebug
+        if not isinstance(_id, (bytes, bytearray)):
+            _id = _id.encode('utf8')
+        self._id = _id
+        """
+        Each DeviceProperties {ID} can contain:
+        -Name
+        -Password
+        -ACLPermissions
+        """
+        super(DeviceProperties, self).__init__()
+        self.json_handler = JSON_Store(PAIRING_STORE + DEV_PROPS)
+        self.store = self.json_handler.get_store()
+        self._id = _id
+
+    def getDeviceName(self):
+        try:
+            return self.get_string(self._id, 'deviceName')
+        except KeyError:
+            return None
+
+    def setDeviceName(self, _value=None):
+        name = self.set_string(self._id, 'deviceName', _value)
+        # return _value
+
+    def isHKACLEnabled(self):
+        try:
+            return self.get_string(self._id, 'Enable_HK_Access_Control')
+        except KeyError:
+            return None
+
+    def setHKACL(self, _value=None):
+        hkacl = self.set_string(self._id, 'Enable_HK_Access_Control', _value)
+
+    def getDevicePassword(self):
+        try:
+            return self.get_string(self._id, 'devicePassword')
+        except KeyError:
+            return None
+
+    def setDevicePassword(self, _value=None):
+        try:
+            pw = self.set_string(self._id, 'devicePassword', _value)
+        except KeyError:
+            pass
+
+    def getDeviceACL(self):
+        try:
+            return self.get_permissions(self._id).decode()
+        except KeyError:
+            return None
+
+    def setDeviceACL(self, _value=None):
+        if isinstance(_value, (int)):
+            _value = int.to_bytes(_value, 1, 'big')
+        acl = self.set_permissions(self._id, _value)
+        # return _value
+
+
 # noinspection PyMethodMayBeStatic
 class Hap:
-    def __init__(self, identifier):
+    def __init__(self, identifier, isDebug=False):
+        self.isDebug = isDebug
         self.transient = False
         self.encrypted = False
+        self.mfi_setup = False
         self.pair_setup_steps_n = 5
+        if self.isDebug:
+            self.logger = get_screen_logger('HAP', level='DEBUG')
+        else:
+            self.logger = get_screen_logger('HAP', level='INFO')
+        # Ensure the identifier string is binary (utf8)
+        if not isinstance(identifier, (bytes, bytearray)):
+            identifier = identifier.encode('utf8')
 
         """
         TODO: controller_id is (meant to be) evident from the HAP connection,
-        but ap2-receciver handles only 1 simultaneous connection, whereas the
+        but ap2-receiver handles only 1 simultaneous connection, whereas the
         HAP spec mandates eight (8).
         """
         self.controller_id = None
@@ -298,7 +423,7 @@ class Hap:
         self.ltsk = LTSK(self.accessory_pairing_id)
 
         if self.ltsk.has_entry(self.accessory_pairing_id):
-            print('Loading ed25519 keypair for', self.accessory_pairing_id)
+            self.logger.debug(f'Loading ed25519 keypair for own ID: {self.accessory_pairing_id.decode("utf-8")}')
             self.accessory_ltsk = ed25519.Ed25519PrivateKey.from_private_bytes(
                 self.ltsk.get_ltsk(self.accessory_pairing_id)
             )
@@ -313,7 +438,7 @@ class Hap:
 
         else:
             # Generate new private+public key pair
-            print('Generating new ed25519 keypair for', self.accessory_pairing_id)
+            self.logger.debug(f'Generating new ed25519 keypair for own ID: {self.accessory_pairing_id}')
 
             # NaCl way of doing it:
             # accessory_secret = random(nacl.bindings.crypto_sign_SEEDBYTES)
@@ -394,15 +519,30 @@ class Hap:
                 PairingFlags(flags) == PairingFlags.TRANSIENT:
             self.transient = True
             self.pair_setup_steps_n = 2
+        elif req[Tlv8.Tag.STATE] == PairingState.M1 and \
+                req[Tlv8.Tag.METHOD] == PairingMethod.PAIR_SETUP_AUTH and \
+                Tlv8.Tag.FLAGS in req and \
+                PairingFlags(flags) == PairingFlags.TRANSIENT:
+            """MFi setup - bitflag 51 was enabled
+            result will be wrong, but we can safely set these params.
+            """
+            self.pair_setup_steps_n = 2
+            self.transient = True
+            self.mfi_setup = True
 
         if req[Tlv8.Tag.STATE] == PairingState.M1:
-            print("-----\tPair-Setup [1/%d]" % self.pair_setup_steps_n)
+            self.logger.debug(f"-----\tPair-Setup [1/{self.pair_setup_steps_n}]")
             res = self.pair_setup_m1_m2()
         elif req[Tlv8.Tag.STATE] == PairingState.M3:
-            print("-----\tPair-Setup [2/%d]" % self.pair_setup_steps_n)
+            self.logger.debug(f"-----\tPair-Setup [2/{self.pair_setup_steps_n}]")
             res = self.pair_setup_m3_m4(req[Tlv8.Tag.PUBLICKEY], req[Tlv8.Tag.PROOF])
             if self.transient:
                 self.encrypted = True
+            if self.mfi_setup:
+                try:
+                    raise MFiUnhandledException()
+                except MFiUnhandledException:
+                    self.logger.error("MFi setup is not yet possible.")
         elif req[Tlv8.Tag.STATE] == PairingState.M5:
             res = self.pair_setup_m5_m6(req[Tlv8.Tag.ENCRYPTEDDATA])
         return Tlv8.encode(res)
@@ -425,10 +565,10 @@ class Hap:
         """
 
         if req[Tlv8.Tag.STATE] == PairingState.M1:
-            print("-----\tPair-Verify [1/2]")
+            self.logger.debug("-----\tPair-Verify [1/2]")
             res = self.pair_verify_m1_m2(req[Tlv8.Tag.PUBLICKEY])
         elif req[Tlv8.Tag.STATE] == PairingState.M3:
-            print("-----\tPair-Verify [2/2]")
+            self.logger.debug("-----\tPair-Verify [2/2]")
             status, res = self.pair_verify_m3_m4(req[Tlv8.Tag.ENCRYPTEDDATA])
             if status:
                 self.encrypted = True
@@ -443,13 +583,13 @@ class Hap:
            and req[Tlv8.Tag.IDENTIFIER]
            and req[Tlv8.Tag.PUBLICKEY]
            and req[Tlv8.Tag.PERMISSIONS]):
-            print("-----\tPair-Add [1/1]")
+            self.logger.debug("-----\tPair-Add [1/1]")
             res = self.pair_add_m1_m2(req)
             self.encrypted = True
             self.controller_id = req[Tlv8.Tag.IDENTIFIER]
         else:
-            print("-----\tPair-Add")
-            print(f"Unexpected data received: {req}")
+            self.logger.debug("-----\tPair-Add")
+            self.logger.debug(f"Unexpected data received: {req}")
         return Tlv8.encode(res)
 
     def pair_add_m1_m2(self, req):
@@ -465,7 +605,7 @@ class Hap:
             kTLVType_State <M2>
             kTLVType_Error kTLVError_Authentication
             """
-            print('Controller does not have admin bit set in local pairings list')
+            self.logger.debug('Controller does not have admin bit set in local pairings list')
             return [
                 Tlv8.Tag.STATE, PairingState.M2,
                 Tlv8.Tag.ERROR, PairingErrors.AUTHENTICATION
@@ -485,7 +625,7 @@ class Hap:
              AdditionalControllerPermissions.
             """
             if device_ltpk != ltpk:
-                print('Device LTPK does not match stored LTPK')
+                self.logger.debug('Device LTPK does not match stored LTPK')
                 return [
                     Tlv8.Tag.STATE, PairingState.M2,
                     Tlv8.Tag.ERROR, PairingErrors.UNKNOWN
@@ -518,7 +658,7 @@ class Hap:
                 self.pairings.set_ltpk_and_permissions(_id, device_ltpk, permissions)
             except (PermissionError, ValueError) as e:
                 # If an error occurs while saving, accessory must abort and respond with:
-                print('pair-add was unable to save pairing data to persistent store:')
+                self.logger.debug('pair-add was unable to save pairing data to persistent store:')
                 traceback.print_exception(type(e), e, e.__traceback__)
                 return [
                     Tlv8.Tag.STATE, PairingState.M2,
@@ -545,12 +685,12 @@ class Hap:
         if(req[Tlv8.Tag.STATE] == PairingState.M1
            and req[Tlv8.Tag.METHOD] == PairingMethod.REMOVE_PAIRING
            and req[Tlv8.Tag.IDENTIFIER]):
-            print("-----\tPair-Remove [1/1]")
+            self.logger.debug("-----\tPair-Remove [1/1]")
             res = self.pair_remove_m1_m2(req)
             self.encrypted = True
         else:
-            print("-----\tPair-Remove")
-            print(f"Unexpected data received: {req}")
+            self.logger.debug("-----\tPair-Remove")
+            self.logger.debug(f"Unexpected data received: {req}")
         return Tlv8.encode(res)
 
     def pair_remove_m1_m2(self, req):
@@ -585,7 +725,7 @@ class Hap:
                 self.pairings.delete_pairing(_id)
             except PermissionError as e:
                 # If an error occurs while removing, accessory must abort and respond with:
-                print('pair-remove was unable to delete pairing data:')
+                self.logger.error('pair-remove was unable to delete pairing data:')
                 traceback.print_exception(type(e), e, e.__traceback__)
                 return [
                     Tlv8.Tag.STATE, PairingState.M2,
@@ -617,12 +757,12 @@ class Hap:
 
         if(req[Tlv8.Tag.STATE] == PairingState.M1
            and req[Tlv8.Tag.METHOD] == PairingMethod.LIST_PAIRINGS):
-            print("-----\tPair-List [1/1]")
+            self.logger.debug("-----\tPair-List [1/1]")
             res = self.pair_list_m1_m2(req)
             self.encrypted = True
         else:
-            print("-----\tPair-List")
-            print(f"Unexpected data received: {req}")
+            self.logger.debug("-----\tPair-List")
+            self.logger.debug(f"Unexpected data received: {req}")
         return Tlv8.encode(res)
 
     def pair_list_m1_m2(self, req):
@@ -845,11 +985,11 @@ class Hap:
         5.6.6.1 <M5> Verification
         """
 
-        print("-----\tPair-Setup [3/5]")
+        self.logger.debug("-----\tPair-Setup [3/5]")
         dec_tlv, session_key = self.pair_setup_m5_m6_1(encrypted)
-        print("-----\tPair-Setup [4/5]")
+        self.logger.debug("-----\tPair-Setup [4/5]")
         self.pair_setup_m5_m6_2(dec_tlv)
-        print("-----\tPair-Setup [5/5]")
+        self.logger.debug("-----\tPair-Setup [5/5]")
         enc_tlv, tag = self.pair_setup_m5_m6_3(session_key)
         """
         7. Send the response to the iOS device with the following TLV items:
@@ -957,7 +1097,7 @@ class Hap:
         try:
             verify_key.verify(signature=device_sig, data=device_info)
         except exceptions.InvalidSignature:
-            print('Invalid Signature')
+            self.logger.debug('Invalid Signature')
             return [
                 Tlv8.Tag.STATE, PairingState.M6,
                 Tlv8.Tag.ERROR, PairingErrors.AUTHENTICATION
@@ -1185,7 +1325,7 @@ class Hap:
             try:
                 verify_key.verify(signature=device_sig, data=device_info)
             except exceptions.InvalidSignature:
-                print('Invalid Signature')
+                self.logger.debug('Invalid Signature')
                 return False, [
                     Tlv8.Tag.STATE, PairingState.M4,
                     Tlv8.Tag.ERROR, PairingErrors.AUTHENTICATION
@@ -1228,6 +1368,7 @@ class HAPSocket:
         self.out_count = 0
         self.in_count = 0
         self.out_lock = threading.RLock()  # for locking send operations
+        self.logger = get_screen_logger(__name__, level='INFO')
 
         self._set_ciphers()
         self.curr_in_total = None  # Length of the current incoming block
@@ -1301,10 +1442,10 @@ class HAPSocket:
                     block_length_bytes = self.socket.recv(self.LENGTH_LENGTH)
                     if not block_length_bytes:
                         return result
-                except ConnectionResetError:
-                    print('HAP connection destroyed (unexpectedly).')
-
-                assert len(block_length_bytes) == self.LENGTH_LENGTH
+                    assert len(block_length_bytes) == self.LENGTH_LENGTH
+                except (ConnectionResetError, UnboundLocalError):
+                    self.logger.error('HAP connection destroyed (unexpectedly).')
+                    break
 
                 self.curr_in_total = \
                     struct.unpack("H", block_length_bytes)[0] + 16

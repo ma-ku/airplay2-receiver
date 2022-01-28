@@ -4,14 +4,19 @@ import multiprocessing
 import enum
 import threading
 import time
+import logging
 
 import av
 import numpy
 import pyaudio
 from Crypto.Cipher import ChaCha20_Poly1305
+from Crypto.Cipher import AES
 from av.audio.format import AudioFormat
+from collections import deque
+from operator import attrgetter
 
-from ..utils import get_logger, get_free_tcp_socket, get_free_udp_socket
+
+from ..utils import get_file_logger, get_screen_logger, get_free_socket
 
 
 class RTP:
@@ -46,13 +51,90 @@ class RTP_BUFFERED(RTP):
         self.sequence_no = int.from_bytes(b'\0' + data[1:4], byteorder='big')
 
 
+class RTPRealtimeBuffer:
+    """
+    It's small, simple, resilient.
+    """
+    BUFFER_SIZE = 1
+
+    def __init__(self, size, isDebug=False):
+        self.BUFFER_SIZE = size
+        self.isDebug = isDebug
+        self.queue = deque(maxlen=self.BUFFER_SIZE + 1)
+        """
+        if self.isDebug:
+            self.rtp_logger = get_screen_logger('RTPRealtimeBuffer', level='DEBUG')
+        else:
+            self.rtp_logger = get_screen_logger('RTPRealtimeBuffer', level='INFO')
+        """
+
+    def append(self, rtp):
+        """ puts rtp into the bottom or left of the queue """
+        self.queue.appendleft(rtp)
+
+    def pop(self, seq=None, get_ts=False):
+        if seq is None or seq == 0:  # Start-up
+            return self.queue.pop()
+        else:
+            pos = self.find(seq, get_ts)
+            if pos == len(self.queue) - 1:  # at end
+                return self.queue.pop()
+            elif pos == 0:  # at start
+                return self.queue.popleft()
+            elif pos:  # in midst of queue (jitter)
+                r = self.queue[pos]
+                self.queue.remove(r)
+                return r
+
+    def get_filler(self):
+        """ just get top of buffer """
+        return self.queue[len(self.queue) - 1]
+
+    def amount(self):
+        """ fullness, content """
+        return len(self.queue) / self.queue.maxlen
+
+    def is_full(self):
+        return len(self.queue) == self.queue.maxlen
+
+    def is_empty(self):
+        return len(self.queue) == 0
+
+    def find(self, seq, get_ts=False):
+        """ returns queue index of the sought rtp seqNo/timestamp """
+        found = False
+        lowestFound = 0
+        length = len(self.queue)
+        attr = 'timestamp' if get_ts else 'sequence_no'
+        if length == 0:
+            return 0
+        for i in range(0, length, 1):
+            value = attrgetter(attr)(self.queue[i])
+            if value == seq:
+                found = True
+                return i
+        if found is False:
+            try:  # seek the next best
+                self.find(seq + 1)
+            except RecursionError:
+                # Find lowest in the buffer
+                for i in range(0, length, 1):
+                    thisseq = attrgetter(attr)(self.queue[i])
+                    if i == 0:
+                        lowestFound = thisseq
+                    if thisseq < lowestFound:
+                        lowestFound = thisseq
+                return lowestFound
+
+
 # Very simple circular buffer implementation
 class RTPBuffer:
     # TODO : Centralized for both this buffer size and audioBufferSize returned by SETUP
     BUFFER_SIZE = 1
 
-    def __init__(self, size):
+    def __init__(self, size, isDebug=False):
         self.BUFFER_SIZE = size
+        self.isDebug = isDebug
         self.buffer_array = numpy.empty(self.BUFFER_SIZE, dtype=RTP_BUFFERED)
         # Stores indexes only for quick bisect search
         self.buffer_array_seqs = numpy.empty(self.BUFFER_SIZE, dtype=int)
@@ -63,17 +145,25 @@ class RTPBuffer:
         self.write_index = 0
         self.flush_from_sequence = None
         self.flush_to_sequence = None
+        if self.isDebug:
+            self.rtp_logger = get_screen_logger('RTPBuffer', level='DEBUG')
+        else:
+            self.rtp_logger = get_screen_logger('RTPBuffer', level='INFO')
 
-    def increment_index(self, index):
+    def increment_buffer_index(self, index):
+        # increments the index position in the buffer by one
         return (index + 1) % self.BUFFER_SIZE
 
-    def decrement_index(self, index):
+    def decrement_buffer_index(self, index):
+        # decrements the index position in the buffer by one
         return (index + self.BUFFER_SIZE - 1) % self.BUFFER_SIZE
 
     def add(self, rtp_data):
-        # print("write  - %i %i" % (self.read_index, self.write_index))
-        if self.write_index % 1000 == 0:
-            print("buffer: writing - full at %s - ri=%i - wi=%i - seq=%i" % ("{:.1%}".format(self.get_fullness()), self.read_index, self.write_index, rtp_data.sequence_no))
+        if self.write_index % 1e3 == 0:
+            msg = f"buffer: writing - full at {self.get_fullness():.1%}"
+            msg += f" - ri={self.read_index} - wi={self.write_index}"
+            msg += f" - seq={rtp_data.sequence_no}"
+            self.rtp_logger.info(msg)
 
         used_index = self.write_index
         self.buffer_array[self.write_index] = rtp_data
@@ -82,11 +172,11 @@ class RTPBuffer:
             # First write - init read index
             self.read_index = self.write_index
         else:
-            if self.increment_index(self.write_index) == self.read_index:
+            if self.increment_buffer_index(self.write_index) == self.read_index:
                 # buffer overflow, we "push" the read index
-                print("buffer: over-run")
-                self.read_index = self.increment_index(self.read_index)
-        self.write_index = self.increment_index(self.write_index)
+                self.rtp_logger.warning("buffer full: won't overwrite unparsed data")
+                self.read_index = self.increment_buffer_index(self.read_index)
+        self.write_index = self.increment_buffer_index(self.write_index)
 
         return used_index
 
@@ -97,25 +187,22 @@ class RTPBuffer:
         return self.read_index != -1
 
     def next(self):
-        # print("read   - %i %i" % (self.read_index, self.write_index))
         if self.read_index == -1:
-            print("buffer: read is not possible - empty buffer")
+            self.rtp_logger.warning("buffer empty: read impossible")
             return None
         else:
             buffered_object = self.buffer_array[self.read_index]
-            if self.read_index % 1000 == 0:
-                print("buffer: reading - full at %s - ri=%i - wi=%i - seq=%i"
-                      % ("{:.1%}".format(self.get_fullness()),
-                          self.read_index,
-                          self.write_index,
-                          buffered_object.sequence_no))
+            if self.read_index % 1e3 == 0:
+                msg = f"buffer: reading - full at {self.get_fullness():.1%} - ri={self.read_index}"
+                msg += f" - wi={self.write_index} - seq={buffered_object.sequence_no}"
+                self.rtp_logger.info(msg)
 
-            if self.increment_index(self.read_index) == self.write_index:
+            if self.increment_buffer_index(self.read_index) == self.write_index:
                 # buffer underrun, nothing we can do
-                print("buffer: underrun")
+                self.rtp_logger.warning("buffer low: demand >= supply")
                 self.read_index = -1
             else:
-                self.read_index = self.increment_index(self.read_index)
+                self.read_index = self.increment_buffer_index(self.read_index)
 
         return buffered_object
 
@@ -143,14 +230,15 @@ class RTPBuffer:
 
         while left <= right:
             m = (left + right // 2) % self.BUFFER_SIZE
-            # print('searching left=%d, right=%d, m=%d, srch=%d, now_at=%d' % \
-            # (left, right, m, seq, self.buffer_array_seqs[m] ))
+            msg = f'searching left={left}, right={right},'
+            msg += f' m={m}, srch={seq}, now_at={self.buffer_array_seqs[m]}'
+            self.rtp_logger.debug(msg)
             if self.buffer_array_seqs[m] == seq:
                 return m
             if self.buffer_array_seqs[m] < seq:
-                left = self.increment_index(m)
+                left = self.increment_buffer_index(m)
             elif self.buffer_array_seqs[m] > seq:
-                left = self.decrement_index(m)
+                left = self.decrement_buffer_index(m)
 
     # initialize buffer for reading
     def init(self):
@@ -199,6 +287,34 @@ class AirplayAudFmt(enum.Enum):
     AAC_ELD_48000_1 = 1 << 32
 
 
+class AudioSetup:
+    def __init__(self, sr, ss, cc, codec_tag, ver=0, spf=352, compat_ver=0,
+                 hist_mult=40, init_hist=10, rice_lmt=14, max_run=255, mcfs=0, abr=0):
+        x = bytes()  # a 36-byte QuickTime atom passed through as extradata
+        x += (36).to_bytes(4, byteorder='big')             # 32 bits  atom size
+        x += (codec_tag).encode()                          # 32 bits  tag ('alac')
+        x += int(ver).to_bytes(4, byteorder='big')         # 32 bits  tag version (0)
+        x += int(spf).to_bytes(4, byteorder='big')         # 32 bits  samples per frame
+        x += int(compat_ver).to_bytes(1, byteorder='big')  # 8 bits  compatible version   (0)
+        x += int(ss).to_bytes(1, byteorder='big')          # 8 bits  sample size
+        x += int(hist_mult).to_bytes(1, byteorder='big')   # 8 bits  history mult         (40)
+        x += int(init_hist).to_bytes(1, byteorder='big')   # 8 bits  initial history      (10)
+        x += int(rice_lmt).to_bytes(1, byteorder='big')    # 8 bits  rice param limit     (14)
+        x += int(cc).to_bytes(1, byteorder='big')          # 8 bits  channels
+        x += int(max_run).to_bytes(2, byteorder='big')     # 16 bits  maxRun               (255)
+        x += int(mcfs).to_bytes(4, byteorder='big')        # 32 bits  max coded frame size (0 means unknown)
+        x += int(abr).to_bytes(4, byteorder='big')         # 32 bits  average bitrate      (0 means unknown)
+        x += int(sr).to_bytes(4, byteorder='big')          # 32 bits  samplerate
+        self.extradata = x
+        self.sr = sr
+        self.ss = ss
+        self.cc = cc
+        self.spf = spf
+
+    def get_extra_data(self):
+        return self.extradata
+
+
 class Audio:
     @staticmethod
     def set_audio_params(self, audio_format):
@@ -235,32 +351,31 @@ class Audio:
         else:
             self.channel_count = 2
 
-        print("Negotiated audio format: ", AirplayAudFmt(audio_format))
+        self.audio_screen_logger.debug(f"Negotiated audio format: {AirplayAudFmt(audio_format)}")
 
-    def __init__(self, session_key, audio_format, buff_size):
+    def __init__(
+            self,
+            addr,
+            session_key, session_iv=None,
+            audio_format=None, buff_size=None,
+            streamtype=0,
+            isDebug=False,
+            aud_params: AudioSetup = None,
+    ):
+        self.isDebug = isDebug
+        self.addr = addr
+        if self.isDebug:
+            self.audio_file_logger = get_file_logger("Audio.debug", level="DEBUG")
+            self.audio_screen_logger = get_screen_logger("Audio.Main", level="DEBUG")
+        else:
+            self.audio_screen_logger = get_screen_logger("Audio.Main", level="INFO")
         self.audio_format = audio_format
+        self.audio_params = aud_params
         self.session_key = session_key
-        self.rtp_buffer = RTPBuffer(buff_size)
+        self.session_iv = session_iv
+        sk_len = len(session_key)
+        self.key_and_iv = True if (sk_len == 16 or sk_len == 24 or sk_len == 32 and session_iv is not None) else False
         self.set_audio_params(self, audio_format)
-
-    @staticmethod
-    def set_alac_extradata(self, sample_rate, sample_size, channel_count):
-        extradata = bytes()  # a 36-byte QuickTime atom passed through as extradata
-        extradata += (36).to_bytes(4, byteorder='big')   # 32 bits  atom size
-        extradata += ('alac').encode()                   # 32 bits  tag ('alac')
-        extradata += (0).to_bytes(4, byteorder='big')    # 32 bits  tag version (0)
-        extradata += (352).to_bytes(4, byteorder='big')  # 32 bits  samples per frame
-        extradata += (0).to_bytes(1, byteorder='big')    # 8 bits  compatible version   (0)
-        extradata += (sample_size).to_bytes(1, byteorder='big')  # 8 bits  sample size
-        extradata += (40).to_bytes(1, byteorder='big')   # 8 bits  history mult         (40)
-        extradata += (10).to_bytes(1, byteorder='big')   # 8 bits  initial history      (10)
-        extradata += (14).to_bytes(1, byteorder='big')   # 8 bits  rice param limit     (14)
-        extradata += (channel_count).to_bytes(1, byteorder='big')  # 8 bits  channels
-        extradata += (255).to_bytes(2, byteorder='big')  # 16 bits  maxRun               (255)
-        extradata += (0).to_bytes(4, byteorder='big')    # 32 bits  max coded frame size (0 means unknown)
-        extradata += (0).to_bytes(4, byteorder='big')    # 32 bits  average bitrate      (0 means unknown)
-        extradata += (sample_rate).to_bytes(4, byteorder='big')  # 32 bits  samplerate
-        return extradata
 
     def init_audio_sink(self):
         codecLatencySec = 0
@@ -268,20 +383,25 @@ class Audio:
         self.sink = self.pa.open(format=self.pa.get_format_from_width(2),
                                  channels=self.channel_count,
                                  rate=self.sample_rate,
-                                 output=True)
+                                 output=True,
+                                 # frames_per_buffer=int(self.sample_rate * 1e-3)
+                                 )
         # nice Python3 crash if we don't check self.sink is null. Not harmful, but should check.
         if not self.sink:
             exit()
         # codec = None
-        extradata = None
+        ed = None
         if self.audio_format == AirplayAudFmt.ALAC_44100_16_2.value:
-            extradata = self.set_alac_extradata(self, 44100, 16, 2)
+            ed = AudioSetup(codec_tag='alac', sr=44100, ss=16, cc=2).get_extra_data()
         elif self.audio_format == AirplayAudFmt.ALAC_44100_24_2.value:
-            extradata = self.set_alac_extradata(self, 44100, 24, 2)
+            ed = AudioSetup(codec_tag='alac', sr=44100, ss=24, cc=2).get_extra_data()
         elif self.audio_format == AirplayAudFmt.ALAC_48000_16_2.value:
-            extradata = self.set_alac_extradata(self, 48000, 16, 2)
+            ed = AudioSetup(codec_tag='alac', sr=48000, ss=16, cc=2).get_extra_data()
         elif self.audio_format == AirplayAudFmt.ALAC_48000_24_2.value:
-            extradata = self.set_alac_extradata(self, 48000, 24, 2)
+            ed = AudioSetup(codec_tag='alac', sr=48000, ss=24, cc=2).get_extra_data()
+
+        if self.audio_params:
+            ed = self.audio_params.get_extra_data()
 
         if 'ALAC' in self.af:
             self.codec = av.codec.Codec('alac', 'r')
@@ -302,7 +422,7 @@ class Audio:
         elif'AAC_LC'in self.af:
             codecLatencySec = (2624 / self.sample_rate)
         codecLatencySec = 0
-        print('codecLatencySec:',codecLatencySec)
+        screen_logger.debug(f'codecLatencySec: {codecLatencySec}')
         """
 
         if self.codec is not None:
@@ -310,8 +430,8 @@ class Audio:
             self.codecContext.sample_rate = self.sample_rate
             self.codecContext.channels = self.channel_count
             self.codecContext.format = av.AudioFormat('s' + str(self.sample_size) + 'p')
-        if extradata is not None:
-            self.codecContext.extradata = extradata
+        if ed is not None:
+            self.codecContext.extradata = ed
 
         self.resampler = av.AudioResampler(
             format=av.AudioFormat('s' + str(self.sample_size)).packed,
@@ -320,84 +440,171 @@ class Audio:
         )
 
         audioDevicelatency = \
-            self.pa.get_default_output_device_info()['defaultHighOutputLatency']
-        # defaultLowOutputLatency is also available
-        print(f"audioDevicelatency (sec): {audioDevicelatency:0.5f}")
+            self.pa.get_default_output_device_info()['defaultLowOutputLatency']
+        # defaultLowOutputLatency or defaultHighOutputLatency
+        self.audio_screen_logger.debug(f"audioDevicelatency (sec): {audioDevicelatency:0.5f}")
         pyAudioDelay = self.sink.get_output_latency()
-        print(f"pyAudioDelay (sec): {pyAudioDelay:0.5f}")
+        self.audio_screen_logger.debug(f"pyAudioDelay (sec): {pyAudioDelay:0.5f}")
         ptpDelay = 0.002
         self.sample_delay = pyAudioDelay + audioDevicelatency + codecLatencySec + ptpDelay
-        print(f"Total sample_delay (sec): {self.sample_delay:0.5f}")
+        self.audio_screen_logger.info(f"Total sample_delay (sec): {self.sample_delay:0.5f}")
 
     def decrypt(self, rtp):
-        c = ChaCha20_Poly1305.new(key=self.session_key, nonce=rtp.nonce)
-        c.update(rtp.aad)
-        data = c.decrypt_and_verify(rtp.payload, rtp.tag)
+        data = b''
+        if self.key_and_iv:
+            try:
+                pl_len = len(rtp.payload) + len(rtp.tag) + len(rtp.nonce)
+                # Older streaming model has different payload boundary: pkt end.
+                payload = memoryview(rtp.payload + rtp.tag + rtp.nonce)
+                pl_len_crypted = pl_len & ~0xf
+                pl_len_clear = pl_len & 0xf
+                if(pl_len_crypted % 16 == 0):
+                    # Decrypt using RSA key
+                    c  = AES.new(key=self.session_key, mode=AES.MODE_CBC, iv=self.session_iv)
+                    # decrypt the encrypted portion:
+                    data = c.decrypt(payload[0:pl_len_crypted])
+                    # append the unencrypted trailing bytes (fewer than 16)
+                    data += payload[pl_len_crypted:pl_len]
+                # else:
+                #     data = payload[0:pl_len]
+            except (KeyError, ValueError) as e:
+                self.audio_screen_logger.error(f'RTP AES MODE_CBC decrypt: {repr(e)}')
+        else:
+            c = ChaCha20_Poly1305.new(key=self.session_key, nonce=rtp.nonce)
+            c.update(rtp.aad)  # necessary at least for RTP type 103.
+            try:
+                data = c.decrypt_and_verify(rtp.payload, rtp.tag)
+            except ValueError as e:
+                self.audio_screen_logger.error(f'RTP ChaCha20_Poly1305 decrypt: {repr(e)}')
+                pass
         return data
 
-    def handle(self, rtp):
-        self.logger.debug(
-            "v=%d p=%d x=%d cc=%d m=%d pt=%d seq=%d ts=%d ssrc=%d"
-            % (rtp.version, rtp.padding,
-                rtp.extension, rtp.csrc_count,
-                rtp.marker, rtp.payload_type,
-                rtp.sequence_no, rtp.timestamp,
-                rtp.ssrc))
+    def log(self, rtp):
+        if self.isDebug:
+            msg = f"v={rtp.version} p={rtp.padding} x={rtp.extension}"
+            msg += f" cc={rtp.csrc_count} m={rtp.marker} pt={rtp.payload_type}"
+            msg += f" seq={rtp.sequence_no} ts={rtp.timestamp} ssrc={rtp.ssrc}"
+            self.audio_file_logger.debug(msg)
 
     def process(self, rtp):
         data = self.decrypt(rtp)
         packet = av.packet.Packet(data)
-        for frame in self.codecContext.decode(packet):
-            frame = self.resampler.resample(frame)
-            return frame.planes[0].to_bytes()
+        if(len(data) > 0):
+            try:
+                for frame in self.codecContext.decode(packet):
+                    frame = self.resampler.resample(frame)
+                    return frame.planes[0].to_bytes()
+            except ValueError as e:
+                self.audio_screen_logger.error(repr(e))
+                pass
 
-    def run(self, parent_reader_connection):
+    def run(self, rcvr_cmd_pipe):
         # This pipe is between player (read data) and server (write data)
-        parent_writer_connection, writer_connection = multiprocessing.Pipe()
-        server_thread = threading.Thread(target=self.serve, args=(writer_connection,))
-        player_thread = threading.Thread(target=self.play, args=(parent_reader_connection, parent_writer_connection))
+        here, there = multiprocessing.Pipe()
+        server_thread = threading.Thread(target=self.serve, args=(there,))
+        player_thread = threading.Thread(target=self.play, args=(rcvr_cmd_pipe, here))
 
         server_thread.start()
         player_thread.start()
 
     @classmethod
-    def spawn(cls, session_key, audio_format, buff):
-        audio = cls(session_key, audio_format, buff)
+    def spawn(
+            cls,
+            addr,
+            session_key, iv=None,
+            audio_format=0, buff_size=None,
+            streamtype=0,
+            isDebug=False,
+            aud_params: AudioSetup = None,
+    ):
+        audio = cls(
+            addr,
+            session_key, iv,
+            audio_format, buff_size,
+            streamtype,
+            isDebug,
+            aud_params,
+        )
         # This pipe is reachable from receiver
-        parent_reader_connection, audio.audio_connection = multiprocessing.Pipe()
-        mainprocess = multiprocessing.Process(target=audio.run, args=(parent_reader_connection,))
-        mainprocess.start()
+        rcvr_cmd_pipe, audio.command_chan = multiprocessing.Pipe()
+        audio_proc = multiprocessing.Process(target=audio.run, args=(rcvr_cmd_pipe,))
+        audio_proc.start()
 
-        return audio.port, mainprocess, audio.audio_connection
+        return audio.port, audio_proc, audio.command_chan
 
 
 class AudioRealtime(Audio):
-
-    def __init__(self, session_key, audio_format, buff):
-        super(AudioRealtime, self).__init__(session_key, audio_format, buff)
-        self.socket = get_free_udp_socket()
+    """
+    This method for handling Realtime packets is a bit hand to mouth, and needs
+    at least a few packet's worth of buffer to handle jitter.
+    """
+    def __init__(
+            self,
+            addr,
+            session_key, iv,
+            audio_format, buff_size,
+            streamtype,
+            isDebug=False,
+            aud_params: AudioSetup = None
+    ):
+        super(AudioRealtime, self).__init__(
+            addr,
+            session_key, iv,
+            audio_format, buff_size,
+            streamtype,
+            isDebug,
+            aud_params
+        )
+        self.isDebug = isDebug
+        self.socket = get_free_socket(addr)
         self.port = self.socket.getsockname()[1]
+        self.rtp_buffer = RTPRealtimeBuffer(buff_size, self.isDebug)
 
     def fini_audio_sink(self):
         self.sink.close()
         self.pa.terminate()
 
     def play(self, rtspconn, serverconn):
-        # for now RealTime does not use RTPBuffer at all, we don't use this method
+        # we don't use this method yet
         pass
 
     def serve(self, playerconn):
-        self.logger = get_logger("audio", level="DEBUG")
         self.init_audio_sink()
+        RTP_SEQ_SIZE = 2**16
+        RTP_ROLLOVER = RTP_SEQ_SIZE - 1  # 65535
+        lastRecvdSeqNo = 0
+        lastPlayedSeqNo = 0
+        playing = False
 
         try:
             while True:
                 data, address = self.socket.recvfrom(4096)
                 if data:
-                    rtp = RTP_REALTIME(data)
-                    self.handle(rtp)
-                    audio = self.process(rtp)
-                    self.sink.write(audio)
+                    pkt = RTP_REALTIME(data)
+                    lastRecvdSeqNo = pkt.sequence_no
+                    self.log(pkt)
+                    self.rtp_buffer.append(pkt)
+                    if (
+                        self.rtp_buffer.is_full()
+                    ):
+                        try:
+                            if playing:
+                                rtp = self.rtp_buffer.pop((lastPlayedSeqNo + 1) % RTP_SEQ_SIZE)
+                            else:
+                                rtp = self.rtp_buffer.pop(0)
+                            if not rtp:  # There was a sequence jump (pkt loss)
+                                nextseq = self.rtp_buffer.find((lastPlayedSeqNo + 1) % RTP_SEQ_SIZE)
+                                rtp = self.rtp_buffer.pop(nextseq)
+                            if rtp:
+                                lastPlayedSeqNo = rtp.sequence_no
+                            audio = self.process(rtp)
+                            if(audio):
+                                self.sink.write(audio)
+                                playing = True
+                        except (RecursionError, TypeError) as e:
+                            self.audio_screen_logger.error(repr(e))
+                            playing = False
+                            pass
         except KeyboardInterrupt:
             pass
         finally:
@@ -406,26 +613,50 @@ class AudioRealtime(Audio):
 
 
 class AudioBuffered(Audio):
-    def __init__(self, session_key, audio_format, buff):
-        super(AudioBuffered, self).__init__(session_key, audio_format, buff)
-        self.socket = get_free_tcp_socket()
+    def __init__(
+            self,
+            addr,
+            session_key, iv=None,
+            audio_format=None, buff_size=None,
+            streamtype=0,
+            isDebug=False,
+            aud_params: AudioSetup = None
+    ):
+        super(AudioBuffered, self).__init__(
+            addr,
+            session_key, iv,
+            audio_format, buff_size,
+            streamtype,
+            isDebug,
+            aud_params,
+        )
+        self.isDebug = isDebug
+        if self.isDebug:
+            self.ab_file_logger = get_file_logger("AudioBuffered", level="DEBUG")
+            self.ab_screen_logger = get_screen_logger("AudioBuffered", level='DEBUG')
+        else:
+            self.ab_screen_logger = get_screen_logger("AudioBuffered", level="INFO")
+        self.socket = get_free_socket(addr, tcp=True)
         self.port = self.socket.getsockname()[1]
-        self.anchorMonotonicTime = None
-        self.anchorRtpTime = None
+        self.anchorMonotonicTime = None  # local play start time in nanos
+        self.rtp_buffer = RTPBuffer(buff_size, self.isDebug)
+        self.anchorRtpTime = None  # remote playback start in RTP Hz
 
     def get_time_offset(self, rtp_ts):
+        # gets the offset in millis from incoming RTP timestamp vs playout millis
+        # Usually fills to about ~120 seconds ahead for buffered streams.
         if not self.anchorRtpTime:
             return 0
         rtptime_offset = rtp_ts - self.anchorRtpTime
-        realtime_offset_ms = (time.monotonic_ns() - self.anchorMonotonicTime) / 10 ** 6
-        time_offset_ms = (1000 * rtptime_offset / self.sample_rate) - realtime_offset_ms
-        return time_offset_ms
+        realtime_offset_ms = (time.monotonic_ns() - self.anchorMonotonicTime) * 1e-6
+        time_offset_ms = (1000 * rtptime_offset / self.sample_rate) - int(realtime_offset_ms)
+        return int(time_offset_ms)
 
     def get_min_timestamp(self):
-        realtime_offset_sec = (time.monotonic_ns() - self.anchorMonotonicTime) / 10 ** 9
-        print("player: get_min_timestamp - realtime_offset_sec={:06.4f}".format(realtime_offset_sec))
+        realtime_offset_sec = (time.monotonic_ns() - self.anchorMonotonicTime) * 1e-9
+        self.ab_screen_logger.debug(f"playback: get_min_timestamp - realtime_offset_sec={realtime_offset_sec:06.4f}")
         res = self.anchorRtpTime + realtime_offset_sec * self.sample_rate
-        print("player: get_min_timestamp return=%i" % res)
+        self.ab_screen_logger.debug(f"playback: get_min_timestamp return={res}")
 
         return res
 
@@ -438,9 +669,9 @@ class AudioBuffered(Audio):
                     finished = True
                 else:
                     pass
-                    # print("player: still forwarding.. ts=%i" % rtp.timestamp)
+                    # self.ab_screen_logger.info(f"playback: still forwarding... ts={rtp.timestamp}")
             else:
-                print("player: !!! error while forwarding !!!")
+                self.ab_screen_logger.error("playback: !!! error while forwarding !!!")
                 finished = True
 
     # player moves readindex in buffer
@@ -459,7 +690,7 @@ class AudioBuffered(Audio):
             else:
                 server_timeout = 0
 
-            if self.rtp_buffer.can_read():
+            if self.rtp_buffer.can_read() and self.rtp_buffer.get_fullness() > 0.2:
                 data_ready = True
 
             if serverconn.poll(server_timeout):
@@ -467,9 +698,9 @@ class AudioBuffered(Audio):
                 if message == "data_ready":
                     data_ready = True
                 elif message == "data_ontime_response":
-                    print("player: ontime data response received")
+                    self.ab_screen_logger.info("playback: ontime data response received")
                     ts = self.get_min_timestamp()
-                    print("player: forwarding to timestamp %i" % ts)
+                    self.ab_screen_logger.info(f"playback: forwarding to timestamp {ts}")
                     self.forward(ts)
 
                     data_ontime = True
@@ -487,12 +718,11 @@ class AudioBuffered(Audio):
                     data_ready = False
 
                 elif str.startswith(message, "flush_from_until_seq"):
-                    pending_flush_from_seq, pending_flush_until_seq = str.split(message, "-")[-2:]
-                    pending_flush_from_seq = int(pending_flush_from_seq)
-                    pending_flush_until_seq = int(pending_flush_until_seq)
-
-                    print("player: request flush received from-until %i-%i" % (pending_flush_from_seq, pending_flush_until_seq))
-                    print("player: relay message to server to flush from-until sequence %i-%i" % (pending_flush_from_seq, pending_flush_until_seq))
+                    from_int, until_int = map(int, str.split(message, "-")[-2:])
+                    msg = f"playback: received flush request from-until"
+                    seqplus = f" sequence {from_int}-{until_int}. Relaying to server."
+                    msg += seqplus
+                    self.ab_screen_logger.info(msg)
                     serverconn.send(message)
 
             if playing and data_ready:
@@ -501,13 +731,20 @@ class AudioBuffered(Audio):
                     time_offset_ms = self.get_time_offset(rtp.timestamp)
                     if i % 1000 == 0:
                         # pass
-                        print("player: offset is %i ms" % time_offset_ms)
-                    if time_offset_ms >= (self.sample_delay * 1000):
-                        # print("player: offset %i ms too big - seq = %i - sleeping %s sec" % (time_offset_ms, rtp.sequence_no, "{:05.2f}".format(time_offset_ms /1000)))
-                        # time.sleep(time_offset_ms / 1000)
-                        time.sleep((self.sample_delay / 2) - 0.001)
-                    elif time_offset_ms < -100:
-                        print("player: offset %i ms too low - seq = %i - sending ontime data request" % (time_offset_ms, rtp.sequence_no))
+                        self.ab_screen_logger.info(f"playback: offset is {time_offset_ms} ms")
+                    if time_offset_ms >= (self.sample_delay * 10**3):
+                        msg = f"playback: offset {time_offset_ms} ms too big"
+                        msg += f" - seq = {rtp.sequence_no} - sleeping {time_offset_ms * 1e-3:5.2f} sec"
+                        self.ab_screen_logger.debug(msg)
+                        # This method is more smooth, but more delay vs other devices.
+                        time.sleep(time_offset_ms * 10**-3)
+                        # This method gets sync almost exact, by itself, but stutters a bit at start.
+                        # time.sleep((self.sample_delay * 0.5) - 0.001)
+                        pass
+                    elif time_offset_ms < -1e2:
+                        msg = f"playback: offset of {time_offset_ms} ms too late "
+                        msg += f"seq={rtp.sequence_no}, ts={rtp.timestamp} - sent ontime data request to server"
+                        self.ab_screen_logger.info(msg)
                         # request on_time data message
                         serverconn.send("on_time_data_request")
                         data_ontime = False
@@ -519,7 +756,6 @@ class AudioBuffered(Audio):
     # server moves write index in buffer
     # the exception to this rule is the buffer initialization (init call)
     def serve(self, playerconn):
-        self.logger = get_logger("audio", level="DEBUG")
         self.init_audio_sink()
 
         conn, addr = self.socket.accept()
@@ -530,48 +766,53 @@ class AudioBuffered(Audio):
                 while playerconn.poll():
                     message = playerconn.recv()
                     if str.startswith(message, "flush_from_until_seq"):
-                        print("server: flush request received: %s" % message)
-                        pending_flush_from_seq, pending_flush_until_seq = str.split(message, "-")[-2:]
-                        pending_flush_from_seq = int(pending_flush_from_seq)
-                        seq_to_overtake = int(pending_flush_until_seq)
-                        from_index = self.rtp_buffer.find_seq(pending_flush_from_seq)
+                        self.ab_screen_logger.info(f"server: received flush request: {message}")
+                        from_int, seq_to_overtake = map(int, str.split(message, "-")[-2:])
+                        from_index = self.rtp_buffer.find_seq(from_int)
                         if from_index:
                             if self.rtp_buffer.flush_write(from_index):
-                                print("server: successfully flushed - write index moved to %i" % from_index)
+                                self.ab_screen_logger.info(f"server: successfully flushed - write index moved to {from_index}")
                             else:
-                                print("server: flush did not move write index")
+                                self.ab_screen_logger.info("server: flush did not move write index")
                     elif message == "on_time_data_request":
-                        print("server: ontime data request received")
+                        self.ab_screen_logger.debug("server: ontime data request received")
                         pending_ontime_data_request = True
 
+                # Receive RTP packets from the TCP stream:
                 message = conn.recv(2, socket.MSG_WAITALL)
                 if message:
+                    # Each RTP packet is preceeded by a uint16 of its size
                     data_len = int.from_bytes(message, byteorder='big')
+                    # Then the RTP packet:
                     data = conn.recv(data_len - 2, socket.MSG_WAITALL)
 
                     rtp = RTP_BUFFERED(data)
-                    self.handle(rtp)
+                    self.log(rtp)
                     time_offset_ms = self.get_time_offset(rtp.timestamp)
-                    # print("server: writing seq %i timeoffset %i" % (rtp.sequence_no, time_offset_ms))
+                    # self.ab_screen_logger.debug(f"server: writing seq={rtp.sequence_no} offset={time_offset_ms} msec")
                     if seq_to_overtake is None:
                         self.rtp_buffer.add(rtp)
                     else:
-                        print("server: searching sequence %i - current is %i" % (seq_to_overtake, rtp.sequence_no))
+                        msg = f"server: searching sequence {seq_to_overtake} -"
+                        msg += f" current is {rtp.sequence_no}"
+                        self.ab_screen_logger.debug(msg)
                         # do not write data if it is expired
                         if rtp.sequence_no >= seq_to_overtake:
-                            if pending_flush_from_seq == 0:
-                                print("server: buffer initialisation")
+                            if from_int == 0:
+                                self.ab_screen_logger.debug("server: buffer initialisation")
                                 self.rtp_buffer.init()
                             self.rtp_buffer.add(rtp)
-                            print("server: requested sequence to overtake %i - receiving sequence %i" % (seq_to_overtake, rtp.sequence_no))
+                            msg = f"server: requested sequence to overtake "
+                            msg += f"{seq_to_overtake} - received sequence {rtp.sequence_no}"
+                            self.ab_screen_logger.info(msg)
                             # as soon as we overtake seq_to_overtake sequence, let's inform the player
                             playerconn.send("data_ready")
                             seq_to_overtake = None
                     if pending_ontime_data_request:
-                        if time_offset_ms >= 100:
+                        if abs(time_offset_ms) >= 1e2:
                             pending_ontime_data_request = False
                             playerconn.send("data_ontime_response")
-                            print("server: ontime data response sent")
+                            self.ab_screen_logger.debug("server: ontime data response sent")
 
         except KeyboardInterrupt:
             pass
