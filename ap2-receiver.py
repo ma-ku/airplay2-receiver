@@ -68,7 +68,7 @@ FEATURES = 0x1c340405fca00
 
 # 0x4A7FCA00,0xBC354BD0
 
-class Feat(IntFlag):
+class Feat:
     # https://emanuelecozzi.net/docs/airplay2/features/
     # https://openairplay.github.io/airplay-spec/features.html
     # https://nto.github.io/AirPlay.html
@@ -181,6 +181,7 @@ FEATURES = (
 
 # PI = Public ID (can be GUID, MAC, some string)
 PI = None
+PI = b'aa5cb8df-7f14-4249-901a-5e748ce57a93'
 
 # The device MAC - string form.
 DEVICE_ID = None
@@ -234,6 +235,8 @@ def get_hex_bitmask(in_features):
     """
     prepares the feature bits into text form
     """
+    print('features:')
+    print(in_features)
     if in_features.bit_length() <= 32:
         # print(f"{hex(in_features)}")
         return f"{hex(in_features)}"
@@ -280,7 +283,6 @@ def setup_global_structs(args, isDebug=False):
         else:
             PI = b'aa5cb8df-7f13-4249-901a-5e758ce57a9'
 
-    LTPK = LTPK()
     global LTPK_OBJ
     global DEV_NAME
     LTPK_OBJ = LTPK(PI, isDebug)
